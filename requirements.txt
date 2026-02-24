@@ -1,0 +1,7 @@
+mss
+pillow
+easyocr
+wordfreq
+keyboard
+numpy
+customtkinter
