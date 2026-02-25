@@ -44,6 +44,12 @@ POST_SEND_LOOP_DELAY_S = 0.0
 ACTIVE_POLL_SLEEP_S = 0.005
 IDLE_POLL_SLEEP_S = 0.02
 TURBO_TYPING_DEFAULT = True
+HUMAN_MODE_DEFAULT = False
+HUMAN_WORD_DELAY_MIN_MS = 70
+HUMAN_WORD_DELAY_MAX_MS = 260
+HUMAN_CHAR_DELAY_FLOOR_MS = 20
+HUMAN_CHAR_DELAY_MIN_SPREAD_MS = 18
+HUMAN_CHAR_DELAY_SCALE = 3.0
 
 DEFAULT_CHAR_DELAY_MS = 1
 MIN_CHAR_DELAY_MS = 1
@@ -495,11 +501,28 @@ def _sendinput_enter() -> bool:
         return False
 
 
-def human_type_and_send(word: str, char_delay_ms: int) -> str:
+def human_type_and_send(word: str, char_delay_ms: int, human_mode: bool = False) -> str:
     base = max(MIN_CHAR_DELAY_MS, int(char_delay_ms)) / 1000.0
-    turbo_mode = int(char_delay_ms) <= 1
-    if WORD_EDGE_DELAY_ENABLED:
+    turbo_mode = (not human_mode) and int(char_delay_ms) <= 1
+
+    if human_mode:
+        time.sleep(random.uniform(HUMAN_WORD_DELAY_MIN_MS, HUMAN_WORD_DELAY_MAX_MS) / 1000.0)
+    elif WORD_EDGE_DELAY_ENABLED:
         time.sleep(random.uniform(0.03, 0.11))
+
+    def sleep_between_letters() -> None:
+        if turbo_mode:
+            return
+        if human_mode:
+            low_ms = max(HUMAN_CHAR_DELAY_FLOOR_MS, int(char_delay_ms))
+            high_ms = max(
+                low_ms + HUMAN_CHAR_DELAY_MIN_SPREAD_MS,
+                int(char_delay_ms * HUMAN_CHAR_DELAY_SCALE) + HUMAN_CHAR_DELAY_MIN_SPREAD_MS,
+            )
+            time.sleep(random.uniform(low_ms, high_ms) / 1000.0)
+            return
+        jitter = random.uniform(-0.35, 0.45) * base
+        time.sleep(max(0.0, base + jitter))
 
     used_sendinput = False
     if USE_SENDINPUT_TYPING:
@@ -510,12 +533,9 @@ def human_type_and_send(word: str, char_delay_ms: int) -> str:
                 used_sendinput = False
                 break
             typed_count += 1
-            if turbo_mode:
-                continue
-            jitter = random.uniform(-0.35, 0.45) * base
-            time.sleep(max(0.0, base + jitter))
+            sleep_between_letters()
         if used_sendinput:
-            if WORD_EDGE_DELAY_ENABLED:
+            if WORD_EDGE_DELAY_ENABLED and not human_mode:
                 time.sleep(random.uniform(0.03, 0.12))
             if _sendinput_enter():
                 return "ok"
@@ -528,11 +548,8 @@ def human_type_and_send(word: str, char_delay_ms: int) -> str:
     try:
         for ch in word:
             keyboard.write(ch, delay=0)
-            if turbo_mode:
-                continue
-            jitter = random.uniform(-0.35, 0.45) * base
-            time.sleep(max(0.0, base + jitter))
-        if WORD_EDGE_DELAY_ENABLED:
+            sleep_between_letters()
+        if WORD_EDGE_DELAY_ENABLED and not human_mode:
             time.sleep(random.uniform(0.03, 0.12))
         keyboard.send("enter")
         return "ok"
@@ -547,7 +564,9 @@ class SharedState:
     require_turn_text: bool = REQUIRE_YOUR_TURN_TEXT_DEFAULT
     keep_on_top: bool = KEEP_ON_TOP_DEFAULT
     ranked_mode: bool = False
+    human_mode: bool = HUMAN_MODE_DEFAULT
     ui_focused: bool = False
+    custom_region: dict[str, int] | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -581,27 +600,52 @@ class SharedState:
         with self.lock:
             self.ranked_mode = value
 
+    def toggle_human_mode(self) -> bool:
+        with self.lock:
+            self.human_mode = not self.human_mode
+            return self.human_mode
+
+    def set_human_mode(self, value: bool) -> None:
+        with self.lock:
+            self.human_mode = value
+
     def set_ui_focused(self, value: bool) -> None:
         with self.lock:
             self.ui_focused = value
 
-    def snapshot(self) -> tuple[bool, int, bool, bool, bool, bool]:
+    def set_custom_region(self, region: dict[str, int]) -> None:
         with self.lock:
+            self.custom_region = {
+                "left": int(region["left"]),
+                "top": int(region["top"]),
+                "width": int(region["width"]),
+                "height": int(region["height"]),
+            }
+
+    def clear_custom_region(self) -> None:
+        with self.lock:
+            self.custom_region = None
+
+    def snapshot(self) -> tuple[bool, int, bool, bool, bool, bool, bool, dict[str, int] | None]:
+        with self.lock:
+            custom_region = None if self.custom_region is None else dict(self.custom_region)
             return (
                 self.running,
                 self.char_delay_ms,
                 self.require_turn_text,
                 self.keep_on_top,
                 self.ranked_mode,
+                self.human_mode,
                 self.ui_focused,
+                custom_region,
             )
 
 
-def qput(ui_queue: queue.Queue[tuple[str, str]], kind: str, payload: str) -> None:
+def qput(ui_queue: queue.Queue[tuple[str, object]], kind: str, payload: object) -> None:
     ui_queue.put((kind, payload))
 
 
-def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, str]]) -> None:
+def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, object]]) -> None:
     try:
         qput(ui_queue, "status", "Loading OCR model (FR)...")
         reader = easyocr.Reader(["fr"], gpu=False, verbose=False)
@@ -612,6 +656,7 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, str]]) -> No
         focus_point = get_screen_center_point()
         qput(ui_queue, "ready", f"{len(words)} words loaded, {len(blocked)} blocked")
         qput(ui_queue, "region", str(region))
+        qput(ui_queue, "region_box", dict(region))
 
         last_fragment = ""
         last_ocr = ""
@@ -621,6 +666,7 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, str]]) -> No
         last_suggested_word = ""
         ui_focus_warned = False
         last_ranked_mode = False
+        last_manual_region: dict[str, int] | None = None
         start_pressed_prev = False
         quit_pressed_prev = False
 
@@ -644,12 +690,37 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, str]]) -> No
                 start_pressed_prev = start_pressed
                 quit_pressed_prev = quit_pressed
 
-                running, char_delay_ms, require_turn_text, _keep_on_top, ranked_mode, ui_focused = state.snapshot()
-                if ranked_mode != last_ranked_mode:
-                    region = build_capture_region(ranked_mode=ranked_mode)
-                    last_ranked_mode = ranked_mode
-                    qput(ui_queue, "region", str(region))
-                    qput(ui_queue, "status", "Ranked mode ON" if ranked_mode else "Ranked mode OFF")
+                (
+                    running,
+                    char_delay_ms,
+                    require_turn_text,
+                    _keep_on_top,
+                    ranked_mode,
+                    human_mode,
+                    ui_focused,
+                    custom_region,
+                ) = state.snapshot()
+                if custom_region is not None:
+                    if last_manual_region != custom_region or region != custom_region:
+                        region = dict(custom_region)
+                        last_manual_region = dict(custom_region)
+                        qput(ui_queue, "region", f"{region} (manual)")
+                        qput(ui_queue, "region_box", dict(region))
+                        qput(ui_queue, "status", "Custom OCR zone active")
+                else:
+                    if last_manual_region is not None:
+                        last_manual_region = None
+                        region = build_capture_region(ranked_mode=ranked_mode)
+                        last_ranked_mode = ranked_mode
+                        qput(ui_queue, "region", str(region))
+                        qput(ui_queue, "region_box", dict(region))
+                        qput(ui_queue, "status", "Auto OCR zone restored")
+                    elif ranked_mode != last_ranked_mode:
+                        region = build_capture_region(ranked_mode=ranked_mode)
+                        last_ranked_mode = ranked_mode
+                        qput(ui_queue, "region", str(region))
+                        qput(ui_queue, "region_box", dict(region))
+                        qput(ui_queue, "status", "Ranked mode ON" if ranked_mode else "Ranked mode OFF")
                 if not running:
                     ui_focus_warned = False
                     time.sleep(IDLE_POLL_SLEEP_S)
@@ -721,7 +792,7 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, str]]) -> No
 
                 attempt_delay = char_delay_ms + max(0, (fragment_attempts - 1) * 20)
                 try:
-                    type_result = human_type_and_send(word, attempt_delay)
+                    type_result = human_type_and_send(word, attempt_delay, human_mode=human_mode)
                     if type_result == "ok":
                         qput(ui_queue, "typed", word)
                     elif type_result == "partial_fail":
@@ -743,13 +814,13 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, str]]) -> No
 
 def launch_ui() -> int:
     state = SharedState()
-    ui_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+    ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
 
     root = ctk.CTk()
     root.title("WordBot by Hypervisor")
-    root.geometry("470x500")
+    root.geometry("470x560")
     root.resizable(False, False)
     root.attributes("-topmost", KEEP_ON_TOP_DEFAULT)
     root.configure(fg_color="#0b1020")
@@ -766,6 +837,7 @@ def launch_ui() -> int:
     require_turn_var = tk.BooleanVar(value=REQUIRE_YOUR_TURN_TEXT_DEFAULT)
     topmost_var = tk.BooleanVar(value=KEEP_ON_TOP_DEFAULT)
     ranked_mode_var = tk.BooleanVar(value=False)
+    human_mode_var = tk.BooleanVar(value=HUMAN_MODE_DEFAULT)
 
     colors = {
         "bg": "#0b1020",
@@ -811,12 +883,284 @@ def launch_ui() -> int:
         ranked_mode_var.set(ranked_now)
         apply_ranked_ui(ranked_now)
 
+    def on_human_toggle() -> None:
+        human_now = state.toggle_human_mode()
+        human_mode_var.set(human_now)
+        apply_human_ui(human_now)
+        qput(ui_queue, "status", "Human mode ON" if human_now else "Human mode OFF")
+
     def on_hide() -> None:
         root.iconify()
 
     def on_close() -> None:
         state.stop_event.set()
+        region_overlay.close()
         root.destroy()
+
+    current_region_box: dict[str, int] | None = None
+    selection_active = False
+
+    class RegionBoxOverlay:
+        def __init__(self, owner: tk.Misc) -> None:
+            self.owner = owner
+            self.win: tk.Toplevel | None = None
+            self.canvas: tk.Canvas | None = None
+            self.bg_key = "#00ff00"
+
+        def _ensure(self) -> None:
+            if self.win is not None and self.win.winfo_exists():
+                return
+
+            win = tk.Toplevel(self.owner)
+            win.withdraw()
+            win.overrideredirect(True)
+            win.configure(bg=self.bg_key)
+            try:
+                win.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            try:
+                win.wm_attributes("-transparentcolor", self.bg_key)
+            except tk.TclError:
+                pass
+
+            canvas = tk.Canvas(
+                win,
+                bg=self.bg_key,
+                highlightthickness=0,
+                bd=0,
+            )
+            canvas.pack(fill="both", expand=True)
+
+            self.win = win
+            self.canvas = canvas
+            self._set_clickthrough()
+
+        def _set_clickthrough(self) -> None:
+            if self.win is None or not self.win.winfo_exists():
+                return
+            try:
+                user32 = ctypes.windll.user32
+                GWL_EXSTYLE = -20
+                WS_EX_LAYERED = 0x00080000
+                WS_EX_TRANSPARENT = 0x00000020
+                WS_EX_TOOLWINDOW = 0x00000080
+                hwnd = int(self.win.winfo_id())
+                ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                user32.SetWindowLongW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+                )
+            except Exception:
+                pass
+
+        def show(self, region: dict[str, int]) -> None:
+            if int(region.get("width", 0)) <= 0 or int(region.get("height", 0)) <= 0:
+                return
+
+            self._ensure()
+            if self.win is None or self.canvas is None:
+                return
+
+            pad = 4
+            border = 3
+            x = int(region["left"]) - pad
+            y = int(region["top"]) - pad
+            w = max(8, int(region["width"]) + pad * 2)
+            h = max(8, int(region["height"]) + pad * 2)
+
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+            self.canvas.configure(width=w, height=h)
+            self.canvas.delete("all")
+            self.canvas.create_rectangle(
+                1,
+                1,
+                w - 2,
+                h - 2,
+                outline="#ff2b2b",
+                width=border,
+            )
+            self.win.deiconify()
+            self.win.lift()
+
+        def hide(self) -> None:
+            if self.win is None or not self.win.winfo_exists():
+                return
+            self.win.withdraw()
+
+        def close(self) -> None:
+            if self.win is None or not self.win.winfo_exists():
+                return
+            self.win.destroy()
+            self.win = None
+            self.canvas = None
+
+    region_overlay = RegionBoxOverlay(root)
+
+    def on_reset_zone() -> None:
+        state.clear_custom_region()
+        qput(ui_queue, "status", "Manual OCR zone cleared")
+
+    def on_select_zone() -> None:
+        nonlocal selection_active, current_region_box
+
+        if selection_active:
+            return
+        selection_active = True
+
+        was_running, *_rest = state.snapshot()
+        if was_running:
+            state.set_running(False)
+            apply_running_ui(False)
+            qput(ui_queue, "status", "Bot paused for zone selection")
+
+        region_overlay.hide()
+
+        try:
+            with mss.mss() as sct:
+                mon = dict(sct.monitors[1])
+        except Exception as exc:
+            selection_active = False
+            qput(ui_queue, "error", f"Unable to open selector: {type(exc).__name__}: {exc}")
+            return
+
+        try:
+            select_zone_btn.configure(state="disabled", text="Select OCR Zone (click 2 points)")
+            reset_zone_btn.configure(state="disabled")
+        except Exception:
+            pass
+
+        overlay = tk.Toplevel(root)
+        overlay.overrideredirect(True)
+        overlay.configure(bg="#000000")
+        overlay.geometry(f'{mon["width"]}x{mon["height"]}+{mon["left"]}+{mon["top"]}')
+        try:
+            overlay.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            overlay.attributes("-alpha", 0.25)
+        except tk.TclError:
+            pass
+
+        canvas = tk.Canvas(
+            overlay,
+            bg="#000000",
+            highlightthickness=0,
+            bd=0,
+            width=int(mon["width"]),
+            height=int(mon["height"]),
+            cursor="crosshair",
+        )
+        canvas.pack(fill="both", expand=True)
+
+        info_id = canvas.create_text(
+            16,
+            16,
+            anchor="nw",
+            fill="#ffffff",
+            font=("Consolas", 13, "bold"),
+            text="Select OCR Zone: click first corner, then second corner (Esc = cancel)",
+        )
+
+        first_click: tuple[int, int] | None = None
+        start_marker_id: int | None = None
+        preview_rect_id: int | None = None
+
+        def canvas_xy(screen_x: int, screen_y: int) -> tuple[int, int]:
+            return int(screen_x - int(mon["left"])), int(screen_y - int(mon["top"]))
+
+        def reset_selector_ui(message: str) -> None:
+            nonlocal first_click, start_marker_id, preview_rect_id
+            first_click = None
+            if start_marker_id is not None:
+                canvas.delete(start_marker_id)
+                start_marker_id = None
+            if preview_rect_id is not None:
+                canvas.delete(preview_rect_id)
+                preview_rect_id = None
+            canvas.itemconfigure(info_id, text=message)
+
+        def cleanup_selector(cancelled: bool) -> None:
+            nonlocal selection_active
+            selection_active = False
+            try:
+                overlay.destroy()
+            except tk.TclError:
+                pass
+            try:
+                select_zone_btn.configure(state="normal", text="Select OCR Zone (2 clicks)")
+                reset_zone_btn.configure(state="normal")
+            except Exception:
+                pass
+            if cancelled and current_region_box is not None:
+                region_overlay.show(current_region_box)
+
+        def update_preview(event: tk.Event) -> None:
+            nonlocal preview_rect_id
+            if first_click is None:
+                return
+            x1, y1 = first_click
+            x2, y2 = int(event.x_root), int(event.y_root)
+            cx1, cy1 = canvas_xy(x1, y1)
+            cx2, cy2 = canvas_xy(x2, y2)
+            if preview_rect_id is not None:
+                canvas.delete(preview_rect_id)
+            preview_rect_id = canvas.create_rectangle(
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                outline="#ff2b2b",
+                width=2,
+            )
+
+        def handle_click(event: tk.Event) -> None:
+            nonlocal first_click, start_marker_id, preview_rect_id, current_region_box
+            x = int(event.x_root)
+            y = int(event.y_root)
+            if first_click is None:
+                first_click = (x, y)
+                cx, cy = canvas_xy(x, y)
+                if start_marker_id is not None:
+                    canvas.delete(start_marker_id)
+                start_marker_id = canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="#ff2b2b", outline="")
+                canvas.itemconfigure(info_id, text="Second click to finish the OCR zone")
+                return
+
+            x1, y1 = first_click
+            left = min(x1, x)
+            top = min(y1, y)
+            width = abs(x - x1)
+            height = abs(y - y1)
+            if width < 8 or height < 8:
+                reset_selector_ui("Selection too small, click first corner, then second corner")
+                return
+
+            region = {
+                "left": int(left),
+                "top": int(top),
+                "width": int(width),
+                "height": int(height),
+            }
+            state.set_custom_region(region)
+            current_region_box = dict(region)
+            region_overlay.show(region)
+            qput(ui_queue, "region", f"{region} (manual)")
+            qput(ui_queue, "region_box", dict(region))
+            qput(ui_queue, "status", "Custom OCR zone selected")
+            cleanup_selector(cancelled=False)
+
+        def cancel_selector(_event: tk.Event | None = None) -> None:
+            qput(ui_queue, "status", "Zone selection cancelled")
+            cleanup_selector(cancelled=True)
+
+        overlay.bind("<Escape>", cancel_selector)
+        canvas.bind("<Button-1>", handle_click)
+        canvas.bind("<Motion>", update_preview)
+
+        overlay.focus_force()
 
     def make_value_row(parent: ctk.CTkFrame, label: str, variable: tk.StringVar, color: str) -> None:
         row = ctk.CTkFrame(parent, fg_color=colors["row"], corner_radius=10)
@@ -907,6 +1251,47 @@ def launch_ui() -> int:
         text_color=colors["muted"],
         font=ctk.CTkFont(family="Consolas", size=11),
     ).pack(side="right", pady=5)
+
+    zone_row = ctk.CTkFrame(controls, fg_color="transparent")
+    zone_row.pack(fill="x", padx=10, pady=(0, 6))
+    human_btn = ctk.CTkButton(
+        zone_row,
+        text="Human Mode: OFF",
+        command=on_human_toggle,
+        width=122,
+        height=32,
+        corner_radius=10,
+        fg_color=colors["button_dark"],
+        hover_color=colors["button_dark_hover"],
+        text_color=colors["text"],
+        font=ctk.CTkFont(size=11, weight="bold"),
+    )
+    human_btn.pack(side="left")
+    select_zone_btn = ctk.CTkButton(
+        zone_row,
+        text="Select OCR Zone (2 clicks)",
+        command=on_select_zone,
+        height=32,
+        corner_radius=10,
+        fg_color="#a71f2f",
+        hover_color="#c52a3d",
+        text_color="#fff4f4",
+        font=ctk.CTkFont(size=12, weight="bold"),
+    )
+    select_zone_btn.pack(side="left", fill="x", expand=True, padx=(8, 0))
+    reset_zone_btn = ctk.CTkButton(
+        zone_row,
+        text="Auto",
+        command=on_reset_zone,
+        width=72,
+        height=32,
+        corner_radius=10,
+        fg_color=colors["button_dark"],
+        hover_color=colors["button_dark_hover"],
+        text_color=colors["text"],
+        font=ctk.CTkFont(size=12, weight="bold"),
+    )
+    reset_zone_btn.pack(side="left", padx=(8, 0))
 
     ctk.CTkLabel(
         controls,
@@ -1062,8 +1447,25 @@ def launch_ui() -> int:
                 text_color=colors["text"],
             )
 
+    def apply_human_ui(is_human: bool) -> None:
+        if is_human:
+            human_btn.configure(
+                text="Human Mode: ON",
+                fg_color="#8a5b11",
+                hover_color="#a36d15",
+                text_color="#fff4d4",
+            )
+        else:
+            human_btn.configure(
+                text="Human Mode: OFF",
+                fg_color=colors["button_dark"],
+                hover_color=colors["button_dark_hover"],
+                text_color=colors["text"],
+            )
+
     apply_running_ui(False)
     apply_ranked_ui(False)
+    apply_human_ui(HUMAN_MODE_DEFAULT)
 
     def update_focus_flag() -> None:
         try:
@@ -1073,6 +1475,7 @@ def launch_ui() -> int:
             state.set_ui_focused(False)
 
     def poll_ui_queue() -> None:
+        nonlocal current_region_box
         update_focus_flag()
 
         while True:
@@ -1090,6 +1493,10 @@ def launch_ui() -> int:
                 append_log(payload)
             elif kind == "region":
                 append_log(f"OCR box: {payload}")
+            elif kind == "region_box":
+                if isinstance(payload, dict):
+                    current_region_box = dict(payload)
+                    region_overlay.show(current_region_box)
             elif kind == "running":
                 apply_running_ui(payload == "ON")
                 append_log(f"Bot {payload}")
