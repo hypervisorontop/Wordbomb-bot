@@ -32,7 +32,7 @@ DEBUG_OCR = False
 MIN_FRAGMENT_LEN = 2
 CANDIDATE_POOL = 64
 RETRY_SAME_FRAGMENT_AFTER_S = 0.0
-MAX_ATTEMPTS_PER_FRAGMENT = 4
+MAX_ATTEMPTS_PER_FRAGMENT = 0  # 0 = unlimited retries for the same fragment
 FOCUS_CLICK_BEFORE_TYPING = True
 FOCUS_CLICK_COOLDOWN_S = 0.0
 FOCUS_CLICK_SETTLE_S = 0.0
@@ -52,7 +52,7 @@ HUMAN_CHAR_DELAY_MIN_SPREAD_MS = 18
 HUMAN_CHAR_DELAY_SCALE = 3.0
 
 DEFAULT_CHAR_DELAY_MS = 1
-MIN_CHAR_DELAY_MS = 1
+MIN_CHAR_DELAY_MS = 0
 MAX_CHAR_DELAY_MS = 250
 USE_SENDINPUT_TYPING = True
 
@@ -276,10 +276,16 @@ def load_blocked_words() -> set[str]:
     return blocked
 
 
-def pick_word(fragment: str, words: list[str], blocked: set[str]) -> str | None:
+def pick_word(
+    fragment: str,
+    words: list[str],
+    blocked: set[str],
+    excluded: set[str] | None = None,
+) -> str | None:
     fragment = normalize_word(fragment)
     if len(fragment) < MIN_FRAGMENT_LEN:
         return None
+    excluded_words = excluded or set()
 
     search_fragments = [fragment]
     if len(fragment) >= 4:
@@ -295,6 +301,8 @@ def pick_word(fragment: str, words: list[str], blocked: set[str]) -> str | None:
             if frag not in word:
                 continue
             if word in blocked:
+                continue
+            if word in excluded_words:
                 continue
             if len(word) <= len(frag):
                 continue
@@ -502,7 +510,7 @@ def _sendinput_enter() -> bool:
 
 
 def human_type_and_send(word: str, char_delay_ms: int, human_mode: bool = False) -> str:
-    base = max(MIN_CHAR_DELAY_MS, int(char_delay_ms)) / 1000.0
+    base = max(0, int(char_delay_ms)) / 1000.0
     turbo_mode = (not human_mode) and int(char_delay_ms) <= 1
 
     if human_mode:
@@ -664,6 +672,7 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, object]]) ->
         last_attempt_at = 0.0
         last_focus_click_at = 0.0
         last_suggested_word = ""
+        tried_words_for_fragment: set[str] = set()
         ui_focus_warned = False
         last_ranked_mode = False
         last_manual_region: dict[str, int] | None = None
@@ -758,16 +767,21 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, object]]) ->
                     fragment_attempts = 0
                     last_attempt_at = 0.0
                     last_suggested_word = ""
+                    tried_words_for_fragment.clear()
                     qput(ui_queue, "typed", "-")
                 else:
-                    if fragment_attempts >= MAX_ATTEMPTS_PER_FRAGMENT:
+                    if MAX_ATTEMPTS_PER_FRAGMENT > 0 and fragment_attempts >= MAX_ATTEMPTS_PER_FRAGMENT:
                         time.sleep(ACTIVE_POLL_SLEEP_S)
                         continue
-                    if time.time() - last_attempt_at < RETRY_SAME_FRAGMENT_AFTER_S:
+                    if RETRY_SAME_FRAGMENT_AFTER_S > 0 and time.time() - last_attempt_at < RETRY_SAME_FRAGMENT_AFTER_S:
                         time.sleep(ACTIVE_POLL_SLEEP_S)
                         continue
 
-                word = pick_word(fragment, words, blocked)
+                word = pick_word(fragment, words, blocked, excluded=tried_words_for_fragment)
+                if not word and tried_words_for_fragment:
+                    # Exhausted current candidates for this prompt: loop again from the full pool.
+                    tried_words_for_fragment.clear()
+                    word = pick_word(fragment, words, blocked)
 
                 if not word:
                     if last_suggested_word != "(no match)":
@@ -781,6 +795,7 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, object]]) ->
                     qput(ui_queue, "selected", word)
                 qput(ui_queue, "action", f"{fragment} -> {word}")
                 last_suggested_word = word
+                tried_words_for_fragment.add(word)
                 fragment_attempts += 1
                 last_attempt_at = time.time()
 
@@ -790,7 +805,7 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, object]]) ->
                         if FOCUS_CLICK_SETTLE_S > 0:
                             time.sleep(FOCUS_CLICK_SETTLE_S)
 
-                attempt_delay = char_delay_ms + max(0, (fragment_attempts - 1) * 20)
+                attempt_delay = char_delay_ms
                 try:
                     type_result = human_type_and_send(word, attempt_delay, human_mode=human_mode)
                     if type_result == "ok":
@@ -801,7 +816,6 @@ def bot_worker(state: SharedState, ui_queue: queue.Queue[tuple[str, object]]) ->
                     else:
                         qput(ui_queue, "status", "Typing failed, retrying same prompt")
                         last_attempt_at = 0.0
-                        time.sleep(0.01)
                         continue
                 except Exception as exc:
                     qput(ui_queue, "status", f"Typing failed ({type(exc).__name__}), will retry")
@@ -888,6 +902,16 @@ def launch_ui() -> int:
         human_mode_var.set(human_now)
         apply_human_ui(human_now)
         qput(ui_queue, "status", "Human mode ON" if human_now else "Human mode OFF")
+
+    def on_rage() -> None:
+        state.set_char_delay_ms(0)
+        speed_var.set(0.0)
+        speed_label_var.set("0 ms/char")
+        if human_mode_var.get():
+            state.set_human_mode(False)
+            human_mode_var.set(False)
+            apply_human_ui(False)
+        qput(ui_queue, "status", "Rage preset: 0 ms / Human OFF")
 
     def on_hide() -> None:
         root.iconify()
@@ -1318,6 +1342,19 @@ def launch_ui() -> int:
         text_color=colors["muted"],
         font=ctk.CTkFont(size=12),
     ).pack(anchor="w", padx=12, pady=(0, 6))
+    rage_btn = ctk.CTkButton(
+        controls,
+        text="Rage",
+        command=on_rage,
+        width=90,
+        height=30,
+        corner_radius=10,
+        fg_color="#c91f1f",
+        hover_color="#ea2a2a",
+        text_color="#fff6f6",
+        font=ctk.CTkFont(size=12, weight="bold"),
+    )
+    rage_btn.pack(anchor="w", padx=12, pady=(0, 8))
 
     options_row = ctk.CTkFrame(controls, fg_color="transparent")
     options_row.pack(fill="x", padx=10, pady=(0, 10))
